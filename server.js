@@ -1,5 +1,6 @@
 const express = require('express');
 const { familyRouter, initFamilyStorage } = require('./modules/family');
+const { authRouter } = require('./modules/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 app.use(familyRouter);
 
 app.use(express.json());
+app.use(authRouter);
 
 app.get('/', (req, res) => {
   res.json({ message: 'Hello from Express', time: new Date().toISOString() });

@@ -3,31 +3,30 @@
  *
  *   family/<id>/family.json     that family's history (any JSON object)
  *   family/<id>/photos/<file>   that family's profile pictures
+ *   family/auth.json            PIN hashes and roles (see auth.js)
  *
- * Routes (mounted by server.ts with `app.use(familyRouter)`):
- *   GET    /families                       -> [{ id, members?, photos, updated }]
- *   GET    /family                         -> the "default" family's JSON (old single-family clients)
- *   POST   /family                         -> replace the "default" family's JSON
- *   GET    /family/:id                     -> that family's JSON (404 if it does not exist)
- *   POST   /family/:id                     -> create or replace it (JSON body)
- *   DELETE /family/:id                     -> delete the family with all its photos
- *   GET    /family/:id/photos              -> ["a1b2.jpg", ...]
- *   POST   /family/:id/photos[?name=<n>]   -> upload one image (raw body, Content-Type image/*) -> 201 { file, url }
- *   GET    /family/:id/photos/:file        -> the image
- *   DELETE /family/:id/photos/:file        -> remove it
+ * Every route needs a login token (see auth.js). Roles: viewer < writer < admin < root.
+ *   GET    /families                       root    -> [{ id, name, users, photos, updated }]
+ *   POST   /families                       root    { id, name?, adminPin, adminLabel? } create a family
+ *   DELETE /family/:id                     root    delete the family, its pictures and its PINs
+ *   GET    /family/:id                     viewer  -> that family's JSON
+ *   POST   /family/:id                     writer  replace the JSON (the family must already exist)
+ *   GET    /family/:id/photos              viewer  -> ["a1b2.jpg", ...]
+ *   POST   /family/:id/photos[?name=<n>]   writer  upload one image (raw body, Content-Type image/*) -> 201 { file, url }
+ *   GET    /family/:id/photos/:file        viewer  the image (token may be passed as ?token= for <img>)
+ *   DELETE /family/:id/photos/:file        writer  remove it
  *
- * Family ids: lowercase letters, digits, - and _ (max 64). Only validated names ever reach the
- * file system, so no path can escape its folder. The image type comes from the file's magic bytes.
+ * Only validated names ever reach the file system, so no path can escape its folder.
+ * The image type comes from the file's magic bytes, never from what the client claims.
  */
 const express = require('express');
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const { FAMILY_DIR, exists, atomicWrite } = require('./storage');
+const auth = require('./auth');
 
-const FAMILY_DIR = process.env.FAMILY_DIR || path.join(__dirname, '..', 'family');
-const DEFAULT_ID = 'default';
 const MAX_FAMILIES = Number(process.env.FAMILY_MAX_FAMILIES || 200);
-const LEGACY_JSON = path.join(__dirname, '..', 'family.json');
 const MAX_PHOTO_BYTES = Number(process.env.FAMILY_PHOTO_MAX_BYTES || 5 * 1024 * 1024);
 const MAX_JSON_BYTES = Number(process.env.FAMILY_JSON_MAX_BYTES || 5 * 1024 * 1024);
 
@@ -45,43 +44,14 @@ function sniff(b) {
 }
 const MIME = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif' };
 
-/** One write at a time per file, and atomic (temp file + rename) so a crash never leaves half a file. */
-let writeChain = Promise.resolve();
-function atomicWrite(file, data) {
-  const job = writeChain.then(async () => {
-    const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-    try {
-      await fs.writeFile(tmp, data);
-      await fs.rename(tmp, file);
-    } catch (e) {
-      await fs.rm(tmp, { force: true });
-      throw e;
-    }
-  });
-  writeChain = job.catch(() => undefined);
-  return job;
-}
-
 const ah = fn => (req, res, next) => { fn(req, res, next).catch(next); };
 
 const jsonPath = (id) => path.join(FAMILY_DIR, id, 'family.json');
 const photosDir = (id) => path.join(FAMILY_DIR, id, 'photos');
-const exists = (p) => fs.access(p).then(() => true, () => false);
 
-/** Create the base folder and move earlier single-family layouts into family/default/. */
 async function initFamilyStorage() {
   await fs.mkdir(FAMILY_DIR, { recursive: true });
-  const def = path.join(FAMILY_DIR, DEFAULT_ID);
-  if (await exists(def)) return;
-  const oldJson = [path.join(FAMILY_DIR, 'family.json'), LEGACY_JSON];
-  const oldPhotos = path.join(FAMILY_DIR, 'photos');
-  const haveJson = (await Promise.all(oldJson.map(exists))).findIndex(Boolean);
-  const havePhotos = await exists(oldPhotos);
-  if (haveJson < 0 && !havePhotos) return;
-  await fs.mkdir(def, { recursive: true });
-  if (haveJson >= 0) await fs.copyFile(oldJson[haveJson], jsonPath(DEFAULT_ID));
-  if (havePhotos) await fs.rename(oldPhotos, photosDir(DEFAULT_ID));
-  await fs.rm(path.join(FAMILY_DIR, 'family.json'), { force: true });
+  await auth.initAuth();
 }
 
 const familyRouter = express.Router();
@@ -92,76 +62,63 @@ familyRouter.param('id', (req, res, next, id) => {
   next();
 });
 
+const needFamily = (req, res, next) => auth.hasFamily(req.params.id) ? next() : res.status(404).json({ error: 'family not found' });
+
 async function readDoc(id) {
   try { return await fs.readFile(jsonPath(id), 'utf-8'); }
   catch (e) { if (e?.code === 'ENOENT') return null; throw e; }
 }
 
-async function saveDoc(id, doc) {
-  if (!(await exists(path.join(FAMILY_DIR, id)))) {
-    const count = (await fs.readdir(FAMILY_DIR, { withFileTypes: true })).filter(d => d.isDirectory()).length;
-    if (count >= MAX_FAMILIES) throw Object.assign(new Error(`family limit reached (${MAX_FAMILIES})`), { status: 409 });
-  }
-  await fs.mkdir(photosDir(id), { recursive: true });
-  await atomicWrite(jsonPath(id), JSON.stringify(doc, null, 2));
-}
-
 const jsonBody = express.json({ limit: MAX_JSON_BYTES });
 const validDoc = (d) => !!d && typeof d === 'object';
 
-familyRouter.get('/families', ah(async (_req, res) => {
-  const dirs = (await fs.readdir(FAMILY_DIR, { withFileTypes: true })).filter(d => d.isDirectory() && SAFE_ID.test(d.name));
-  const list = await Promise.all(dirs.map(async d => {
-    const photos = (await fs.readdir(photosDir(d.name)).catch(() => [])).filter(n => SAFE_FILE.test(n)).length;
-    const updated = await fs.stat(jsonPath(d.name)).then(s => s.mtime.toISOString(), () => null);
-    return { id: d.name, photos, updated };
-  }));
+familyRouter.get('/families', auth.guard('root'), ah(async (_req, res) => {
+  const list = await Promise.all(auth.familyList().map(async f => ({
+    ...f,
+    photos: (await fs.readdir(photosDir(f.id)).catch(() => [])).filter(n => SAFE_FILE.test(n)).length,
+    updated: await fs.stat(jsonPath(f.id)).then(s => s.mtime.toISOString(), () => null)
+  })));
   res.json(list.sort((a, b) => a.id.localeCompare(b.id)));
 }));
 
-// Old single-family clients: /family means the "default" family.
-familyRouter.get('/family', ah(async (_req, res) => {
-  res.type('application/json').send((await readDoc(DEFAULT_ID)) ?? '{}');
+familyRouter.post('/families', auth.guard('root'), express.json({ limit: '10kb' }), ah(async (req, res) => {
+  const { id, name, adminPin, adminLabel } = req.body || {};
+  if (auth.familyList().length >= MAX_FAMILIES) return void res.status(409).json({ error: `family limit reached (${MAX_FAMILIES})` });
+  const fid = String(id ?? '').toLowerCase();
+  await auth.addFamily(fid, name, String(adminPin ?? ''), adminLabel);
+  await fs.mkdir(photosDir(fid), { recursive: true });
+  if (!(await exists(jsonPath(fid)))) await atomicWrite(jsonPath(fid), '{}');
+  res.status(201).json({ message: 'family created', id: fid });
 }));
-familyRouter.post('/family', jsonBody, ah(async (req, res) => {
+
+familyRouter.get('/family/:id', auth.guard('viewer'), needFamily, ah(async (req, res) => {
+  res.type('application/json').send((await readDoc(req.params.id)) ?? '{}');
+}));
+
+familyRouter.post('/family/:id', auth.guard('writer'), needFamily, jsonBody, ah(async (req, res) => {
   if (!validDoc(req.body)) return void res.status(400).json({ error: 'JSON object or array required' });
-  await saveDoc(DEFAULT_ID, req.body);
-  res.json({ message: 'family.json updated successfully' });
+  await fs.mkdir(photosDir(req.params.id), { recursive: true });
+  await atomicWrite(jsonPath(req.params.id), JSON.stringify(req.body, null, 2));
+  res.json({ message: 'family updated', id: req.params.id });
 }));
 
-familyRouter.get('/family/:id', ah(async (req, res) => {
-  const doc = await readDoc(req.params.id);
-  if (doc === null) return void res.status(404).json({ error: 'family not found' });
-  res.type('application/json').send(doc);
-}));
-
-familyRouter.post('/family/:id', jsonBody, ah(async (req, res) => {
-  if (!validDoc(req.body)) return void res.status(400).json({ error: 'JSON object or array required' });
-  const created = (await readDoc(req.params.id)) === null;
-  await saveDoc(req.params.id, req.body);
-  res.status(created ? 201 : 200).json({ message: created ? 'family created' : 'family updated', id: req.params.id });
-}));
-
-familyRouter.delete('/family/:id', ah(async (req, res) => {
-  const dir = path.join(FAMILY_DIR, req.params.id);
-  if (!(await exists(dir))) return void res.status(404).json({ error: 'family not found' });
-  await fs.rm(dir, { recursive: true, force: true });
+familyRouter.delete('/family/:id', auth.guard('root'), needFamily, ah(async (req, res) => {
+  await auth.removeFamily(req.params.id);
+  await fs.rm(path.join(FAMILY_DIR, req.params.id), { recursive: true, force: true });
   res.json({ message: 'family deleted', id: req.params.id });
 }));
 
 const photoRoute = '/family/:id/photos';
 
-familyRouter.get(photoRoute, ah(async (req, res) => {
-  if (!(await exists(path.join(FAMILY_DIR, req.params.id)))) return void res.status(404).json({ error: 'family not found' });
+familyRouter.get(photoRoute, auth.guard('viewer'), needFamily, ah(async (req, res) => {
   const names = (await fs.readdir(photosDir(req.params.id)).catch(() => [])).filter(n => SAFE_FILE.test(n)).sort();
   res.json(names);
 }));
 
-familyRouter.post(photoRoute,
+familyRouter.post(photoRoute, auth.guard('writer'), needFamily,
   express.raw({ type: ['image/*', 'application/octet-stream'], limit: MAX_PHOTO_BYTES }),
   ah(async (req, res) => {
     const id = req.params.id;
-    if (!(await exists(path.join(FAMILY_DIR, id)))) return void res.status(404).json({ error: 'family not found - create it first with POST /family/' + id });
     const body = req.body;
     if (!Buffer.isBuffer(body) || !body.length) {
       return void res.status(400).json({ error: 'send the image as the raw request body with an image/* Content-Type' });
@@ -185,7 +142,7 @@ familyRouter.post(photoRoute,
     res.status(201).json({ file, url: `/family/${id}/photos/${file}` });
   }));
 
-familyRouter.get(`${photoRoute}/:file`, ah(async (req, res) => {
+familyRouter.get(`${photoRoute}/:file`, auth.guard('viewer', { allowQueryToken: true }), needFamily, ah(async (req, res) => {
   const file = String(req.params.file);
   if (!SAFE_FILE.test(file)) return void res.status(400).json({ error: 'invalid file name' });
   try {
@@ -193,7 +150,7 @@ familyRouter.get(`${photoRoute}/:file`, ah(async (req, res) => {
     res.set({
       'Content-Type': MIME[path.extname(file).slice(1)],
       'X-Content-Type-Options': 'nosniff',
-      'Cache-Control': 'public, max-age=300',
+      'Cache-Control': 'private, max-age=300',
       // The app may show the picture from another origin (e.g. the GitHub Pages front end).
       'Cross-Origin-Resource-Policy': 'cross-origin'
     }).send(data);
@@ -203,7 +160,7 @@ familyRouter.get(`${photoRoute}/:file`, ah(async (req, res) => {
   }
 }));
 
-familyRouter.delete(`${photoRoute}/:file`, ah(async (req, res) => {
+familyRouter.delete(`${photoRoute}/:file`, auth.guard('writer'), needFamily, ah(async (req, res) => {
   const file = String(req.params.file);
   if (!SAFE_FILE.test(file)) return void res.status(400).json({ error: 'invalid file name' });
   try {
