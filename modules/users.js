@@ -17,7 +17,9 @@ const crypto = require('crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { FAMILY_DIR } = require('./storage');
 
-const VOIP_DIR = path.join(FAMILY_DIR, '..', 'voip');
+// DATA_DIR is the parent that holds both family/ and voip/ as siblings.
+const DATA_DIR = path.dirname(FAMILY_DIR);
+const VOIP_DIR = path.join(DATA_DIR, 'voip');
 const DB_PATH = path.join(VOIP_DIR, 'users.db');
 const PHONE_RE = /^\+?[0-9]{7,15}$/;
 

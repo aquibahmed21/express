@@ -29,7 +29,7 @@ Socket.IO pub/sub signaling for the MeshCall app. Users register once with a pho
 
 Passwords are hashed with PBKDF2-SHA512 (100 000 iterations). Tokens are HMAC-SHA256, 30-day expiry. Set `JWT_SECRET` as an env var so tokens survive server restarts.
 
-Accounts are stored in `<FAMILY_DIR>/../voip/users.db` (SQLite, `node:sqlite`).
+Accounts are stored in `<DATA_DIR>/voip/users.db` (SQLite, `node:sqlite`), where `DATA_DIR` is the parent of `FAMILY_DIR` — so `voip/` and `family/` sit side by side.
 
 ### Socket.IO rooms
 
