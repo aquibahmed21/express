@@ -1,6 +1,6 @@
 /**
  * Signaling users – phone + password registration and login.
- * Accounts are stored in <FAMILY_DIR>/signaling-users.json.
+ * Accounts are stored in <DATA_DIR>/voip/users.db (SQLite via node:sqlite).
  *
  * Routes:
  *   POST /api/register  { phone, password, name }  → { token, name, phone }
@@ -11,34 +11,41 @@
  * Set JWT_SECRET env var for stable tokens across restarts; random otherwise.
  */
 const express = require('express');
-const fs = require('fs/promises');
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
-const { FAMILY_DIR, atomicWrite } = require('./storage');
+const { DatabaseSync } = require('node:sqlite');
+const { FAMILY_DIR } = require('./storage');
 
-const USERS_FILE = path.join(FAMILY_DIR, 'signaling-users.json');
+const VOIP_DIR = path.join(FAMILY_DIR, '..', 'voip');
+const DB_PATH = path.join(VOIP_DIR, 'users.db');
 const PHONE_RE = /^\+?[0-9]{7,15}$/;
 
-// In-memory store: phone → { phone, name, salt, hash, createdAt }
-let users = {};
+// In-memory reference to the open database handle.
+let db = null;
 
 // Stable across restarts only if JWT_SECRET is set as an env var.
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
-// ── Storage ───────────────────────────────────────────────────────────────────
+// ── Database ──────────────────────────────────────────────────────────────────
 
-async function loadUsers() {
-  try {
-    users = JSON.parse(await fs.readFile(USERS_FILE, 'utf-8'));
-  } catch (e) {
-    if (e.code !== 'ENOENT') throw e;
-    users = {};
-  }
+function openDb() {
+  fs.mkdirSync(VOIP_DIR, { recursive: true });
+  db = new DatabaseSync(DB_PATH);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      phone       TEXT PRIMARY KEY,
+      name        TEXT NOT NULL,
+      salt        TEXT NOT NULL,
+      hash        TEXT NOT NULL,
+      created_at  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
+  `);
 }
 
-async function saveUsers() {
-  await fs.mkdir(FAMILY_DIR, { recursive: true });
-  await atomicWrite(USERS_FILE, JSON.stringify(users, null, 2));
+async function loadUsers() {
+  openDb();
 }
 
 // ── Password hashing (PBKDF2) ─────────────────────────────────────────────────
@@ -112,10 +119,12 @@ router.post('/api/register', ah(async (req, res) => {
   if (!PHONE_RE.test(phone)) throw fail(400, 'Invalid phone number (7–15 digits, optional leading +)');
   if (password.length < 6) throw fail(400, 'Password must be at least 6 characters');
   if (!name) throw fail(400, 'Name is required');
-  if (users[phone]) throw fail(409, 'Phone number already registered');
 
-  users[phone] = { phone, name, ...hashPassword(password), createdAt: Date.now() };
-  await saveUsers();
+  const existing = db.prepare('SELECT phone FROM users WHERE phone = ?').get(phone);
+  if (existing) throw fail(409, 'Phone number already registered');
+
+  const { salt, hash } = hashPassword(password);
+  db.prepare('INSERT INTO users (phone, name, salt, hash, created_at) VALUES (?, ?, ?, ?, ?)').run(phone, name, salt, hash, Date.now());
   res.status(201).json({ token: makeToken(phone), name, phone });
 }));
 
@@ -127,7 +136,7 @@ router.post('/api/login', ah(async (req, res) => {
   const wait = Math.max(byIp.wait(ip), byPhone.wait(phone));
   if (wait) { res.set('Retry-After', String(wait)); throw fail(429, `Too many attempts – try again in ${wait}s`); }
 
-  const u = users[phone];
+  const u = db.prepare('SELECT name, salt, hash FROM users WHERE phone = ?').get(phone);
   if (!u || !verifyPassword(password, u.salt, u.hash)) {
     byIp.fail(ip);
     byPhone.fail(phone);
@@ -143,7 +152,7 @@ router.get('/api/me', (req, res) => {
   if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'login required' });
   const payload = verifyToken(h.slice(7));
   if (!payload) return res.status(401).json({ error: 'invalid or expired token' });
-  const u = users[payload.phone];
+  const u = db.prepare('SELECT phone, name FROM users WHERE phone = ?').get(payload.phone);
   if (!u) return res.status(401).json({ error: 'user not found' });
   res.json({ phone: u.phone, name: u.name });
 });
