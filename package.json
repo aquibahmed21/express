@@ -3,6 +3,12 @@
   "version": "1.0.0",
   "description": "Simple Express server",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "express": "^4.21.2" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.4"
+  }
 }

@@ -1,16 +1,24 @@
+const http = require('http');
 const express = require('express');
+const cors = require('cors');
 const { familyRouter, initFamilyStorage } = require('./modules/family');
 const { authRouter } = require('./modules/auth');
+const { usersRouter, loadUsers, verifyToken } = require('./modules/users');
+const { setupSignaling } = require('./modules/signaling');
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
+// Allow cross-origin requests (browser app connects from a different origin).
+app.use(cors());
+
 // Mounted before the global JSON parser: it brings its own, larger body limits.
-// Family history (several families, each with JSON + profile pictures): see modules/family.js
 app.use(familyRouter);
 
 app.use(express.json());
 app.use(authRouter);
+app.use(usersRouter);
 
 app.get('/', (req, res) => {
   res.json({ message: 'Hello from Express', time: new Date().toISOString() });
@@ -25,10 +33,15 @@ app.use((err, req, res, next) => {
   res.status(err.status || err.statusCode || 500).json({ error: err.message || 'Internal Server Error' });
 });
 
-initFamilyStorage()
-  .catch(e => console.error('family storage init failed:', e.message))
-  .finally(() => {
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`Server listening on port ${PORT}`);
-    });
+async function start() {
+  await Promise.all([
+    initFamilyStorage().catch(e => console.error('family storage init failed:', e.message)),
+    loadUsers().catch(e => console.error('users load failed:', e.message)),
+  ]);
+  setupSignaling(server, verifyToken);
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server listening on port ${PORT}`);
   });
+}
+
+start();

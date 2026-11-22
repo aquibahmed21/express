@@ -1,14 +1,55 @@
 # Express server
 
-Simple Express server.
+Express + Socket.IO server — signaling backend for MeshCall and family-history app.
 
 ```bash
 npm install
 npm start        # http://localhost:3000
+
+# Optional env vars:
+JWT_SECRET=...   # stable tokens across restarts (random by default)
+PORT=3000
+FAMILY_DIR=...   # override data directory (default: ./family)
 ```
 
 - `GET /` hello message
 - `GET /health` health check
+
+## MeshCall signaling (`modules/users.js`, `modules/signaling.js`)
+
+Socket.IO pub/sub signaling for the MeshCall app. Users register once with a phone number and password; every Socket.IO connection is authenticated with a 30-day JWT.
+
+### User accounts
+
+| Route | Body | Returns |
+|---|---|---|
+| `POST /api/register` | `{ phone, password, name }` | `{ token, name, phone }` |
+| `POST /api/login` | `{ phone, password }` | `{ token, name, phone }` |
+| `GET /api/me` | — (Bearer token) | `{ phone, name }` |
+
+Passwords are hashed with PBKDF2-SHA512 (100 000 iterations). Tokens are HMAC-SHA256, 30-day expiry. Set `JWT_SECRET` as an env var so tokens survive server restarts.
+
+Accounts are stored in `<FAMILY_DIR>/signaling-users.json`.
+
+### Socket.IO rooms
+
+The client passes `auth: { token }` on connect. After authentication:
+
+| Event (client → server) | Payload |
+|---|---|
+| `join_room` | `{ room, clientData }` |
+| `leave_room` | `{ room }` |
+| `publish` | `{ room, message }` |
+
+| Event (server → client) | Payload |
+|---|---|
+| `room_opened` | `{ room }` |
+| `message` | `{ room, data, id, timestamp, clientId }` |
+| `members` | `{ room, members }` (observable rooms on join) |
+| `member_join` | `{ room, member }` |
+| `member_leave` | `{ room, member }` |
+
+Observable rooms (name starts with `observable-`) maintain a live member list. Every published message is echoed back to the publisher so the client's liveness watchdog works.
 
 ## Family history and logins (`modules/family.js`, `modules/auth.js`)
 
