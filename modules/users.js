@@ -14,7 +14,9 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { DatabaseSync } = require('node:sqlite');
+// node:sqlite needs Node >= 22.5. The Android host runs Node 18, so fall back to a JSON file there.
+let DatabaseSync = null;
+try { ({ DatabaseSync } = require('node:sqlite')); } catch (_) { /* fallback below */ }
 const { FAMILY_DIR } = require('./storage');
 
 // DATA_DIR is the parent that holds both family/ and voip/ as siblings.
@@ -31,8 +33,25 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('he
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
+const JSON_PATH = path.join(VOIP_DIR, 'users.json');
+
+// Minimal stand-in exposing the same prepare().get()/run() calls used below.
+function openJsonDb() {
+  let rows = {};
+  try { rows = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8')); } catch (_) {}
+  const save = () => { fs.writeFileSync(JSON_PATH + '.tmp', JSON.stringify(rows)); fs.renameSync(JSON_PATH + '.tmp', JSON_PATH); };
+  return {
+    exec() {},
+    prepare(sql) {
+      if (sql.startsWith('INSERT')) return { run(phone, name, salt, hash, created_at) { rows[phone] = { phone, name, salt, hash, created_at }; save(); } };
+      return { get(phone) { return rows[phone]; } };
+    },
+  };
+}
+
 function openDb() {
   fs.mkdirSync(VOIP_DIR, { recursive: true });
+  if (!DatabaseSync) { db = openJsonDb(); return; }
   db = new DatabaseSync(DB_PATH);
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
