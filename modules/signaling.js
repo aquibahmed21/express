@@ -21,6 +21,9 @@
  */
 const crypto = require('crypto');
 
+// phone → Set<socketId> — shared with the users router for /api/users/lookup
+const onlinePhones = new Map();
+
 function setupSignaling(httpServer, verifyToken) {
   const { Server } = require('socket.io');
 
@@ -44,6 +47,11 @@ function setupSignaling(httpServer, verifyToken) {
 
   io.on('connection', (socket) => {
     const joinedRooms = new Set();
+    const phone = socket.user?.phone;
+    if (phone) {
+      if (!onlinePhones.has(phone)) onlinePhones.set(phone, new Set());
+      onlinePhones.get(phone).add(socket.id);
+    }
 
     socket.on('join_room', ({ room, clientData } = {}, ack) => {
       if (typeof room !== 'string' || !room) return;
@@ -95,6 +103,10 @@ function setupSignaling(httpServer, verifyToken) {
     socket.on('disconnect', () => {
       for (const room of joinedRooms) cleanupObservable(room);
       joinedRooms.clear();
+      if (phone) {
+        const set = onlinePhones.get(phone);
+        if (set) { set.delete(socket.id); if (set.size === 0) onlinePhones.delete(phone); }
+      }
     });
 
     function cleanupObservable(room) {
@@ -112,4 +124,4 @@ function setupSignaling(httpServer, verifyToken) {
   return io;
 }
 
-module.exports = { setupSignaling };
+module.exports = { setupSignaling, onlinePhones };

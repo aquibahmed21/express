@@ -3,8 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const { familyRouter, initFamilyStorage } = require('./modules/family');
 const { authRouter } = require('./modules/auth');
-const { usersRouter, loadUsers, verifyToken } = require('./modules/users');
-const { setupSignaling } = require('./modules/signaling');
+const { usersRouter, loadUsers, verifyToken, setOnlinePhones } = require('./modules/users');
+const { setupSignaling, onlinePhones } = require('./modules/signaling');
 
 const app = express();
 const server = http.createServer(app);
@@ -39,6 +39,7 @@ async function start() {
     loadUsers().catch(e => console.error('users load failed:', e.message)),
   ]);
   setupSignaling(server, verifyToken);
+  setOnlinePhones(onlinePhones);
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on port ${PORT}`);
   });

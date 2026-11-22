@@ -178,4 +178,34 @@ router.get('/api/me', (req, res) => {
   res.json({ phone: u.phone, name: u.name });
 });
 
-module.exports = { usersRouter: router, loadUsers, verifyToken };
+// Mounted after signaling starts so onlinePhones is populated.
+let _onlinePhones = null;
+function setOnlinePhones(map) { _onlinePhones = map; }
+
+/** GET /api/users/search?q=<query>  — search by phone prefix or name (case-insensitive, max 20) */
+router.get('/api/users/search', (req, res) => {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ') || !verifyToken(h.slice(7))) return res.status(401).json({ error: 'login required' });
+  const q = String(req.query.q ?? '').trim().toLowerCase();
+  if (!q) return res.json([]);
+  const rows = db.prepare(
+    "SELECT phone, name FROM users WHERE lower(phone) LIKE ? OR lower(name) LIKE ? LIMIT 20",
+  ).all(`%${q}%`, `%${q}%`);
+  res.json(rows.map((r) => ({ phone: r.phone, name: r.name, online: !!(_onlinePhones?.has(r.phone)) })));
+});
+
+/** POST /api/users/lookup  body: { phones: string[] }  — batch registration + online status check */
+router.post('/api/users/lookup', (req, res) => {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ') || !verifyToken(h.slice(7))) return res.status(401).json({ error: 'login required' });
+  const phones = Array.isArray(req.body?.phones) ? req.body.phones.filter((p) => typeof p === 'string').slice(0, 500) : [];
+  if (!phones.length) return res.json([]);
+  const placeholders = phones.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT phone, name FROM users WHERE phone IN (${placeholders})`).all(...phones);
+  const found = new Map(rows.map((r) => [r.phone, r.name]));
+  res.json(phones
+    .filter((p) => found.has(p))
+    .map((p) => ({ phone: p, name: found.get(p), online: !!(_onlinePhones?.has(p)) })));
+});
+
+module.exports = { usersRouter: router, loadUsers, verifyToken, setOnlinePhones };
