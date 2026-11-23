@@ -68,7 +68,8 @@ function openJsonDb() {
     exec() {},
     prepare(sql) {
       if (sql.startsWith('INSERT')) {
-        return { run(phone, name, salt, hash, created_at) { rows[phone] = { phone, name, salt, hash, created_at, role: 'user', blocked: 0 }; save(); } };
+        // Handles both 5-arg (legacy register) and 6-arg (root auto-create with role) calls
+        return { run(phone, name, salt, hash, created_at, role = 'user') { rows[phone] = { phone, name, salt, hash, created_at, role, blocked: 0 }; save(); } };
       }
       if (sql.includes('SELECT') && sql.includes('WHERE phone = ?')) {
         return { get(phone) { return rows[phone] || null; } };
@@ -150,11 +151,11 @@ async function loadUsers() {
       db.prepare('UPDATE users SET salt = ?, hash = ? WHERE phone = ?').run(salt, hash, ROOT_PHONE);
       console.log(`[users] Root password updated for ${ROOT_PHONE}`);
     } else {
-      // Root account doesn't exist yet — auto-create it so root can log in without
-      // going through the registration flow first.
+      // Root account doesn't exist yet — auto-create it with 'root' role so root
+      // can log in and immediately have admin powers.
       const { salt, hash } = hashPassword(rootPw);
-      db.prepare('INSERT INTO users (phone, name, salt, hash, created_at) VALUES (?, ?, ?, ?, ?)').run(ROOT_PHONE, 'Root', salt, hash, Date.now());
-      console.log(`[users] Root account auto-created for ${ROOT_PHONE}`);
+      db.prepare('INSERT INTO users (phone, name, salt, hash, created_at, role) VALUES (?, ?, ?, ?, ?, ?)').run(ROOT_PHONE, 'Root', salt, hash, Date.now(), 'root');
+      console.log(`[users] Root account auto-created for ${ROOT_PHONE} with role 'root'`);
     }
   }
   const adminPwStr = process.env.ADMIN_PASSWORDS || '';
