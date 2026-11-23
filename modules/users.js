@@ -23,13 +23,29 @@ const { FAMILY_DIR } = require('./storage');
 const DATA_DIR = path.dirname(FAMILY_DIR);
 const VOIP_DIR = path.join(DATA_DIR, 'voip');
 const DB_PATH = path.join(VOIP_DIR, 'users.db');
-const PHONE_RE = /^\+?[0-9]{7,15}$/;
+const PHONE_RE = /^[0-9]{7,15}$/;
 
 // In-memory reference to the open database handle.
 let db = null;
 
-// Stable across restarts only if JWT_SECRET is set as an env var.
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+// JWT_SECRET must survive server restarts so tokens don't become invalid when the
+// Cloudflare tunnel URL changes. We load/create it from a file on disk.
+function loadJwtSecret() {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  const secretFile = path.join(path.dirname(require('./storage').FAMILY_DIR), 'voip', 'jwt-secret.txt');
+  try {
+    const s = fs.readFileSync(secretFile, 'utf8').trim();
+    if (s.length >= 32) return s;
+  } catch (_) {}
+  // First start: generate and persist.
+  const s = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(secretFile), { recursive: true });
+    fs.writeFileSync(secretFile, s, { mode: 0o600 });
+  } catch (_) {}
+  return s;
+}
+const JWT_SECRET = loadJwtSecret();
 
 // Comma-separated phone numbers that are granted root/admin role automatically.
 // e.g. ADMIN_PHONES=+919876543210,+919876543211
