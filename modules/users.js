@@ -40,10 +40,31 @@ function openJsonDb() {
   let rows = {};
   try { rows = JSON.parse(fs.readFileSync(JSON_PATH, 'utf8')); } catch (_) {}
   const save = () => { fs.writeFileSync(JSON_PATH + '.tmp', JSON.stringify(rows)); fs.renameSync(JSON_PATH + '.tmp', JSON_PATH); };
+  const allRows = () => Object.values(rows);
   return {
     exec() {},
     prepare(sql) {
-      if (sql.startsWith('INSERT')) return { run(phone, name, salt, hash, created_at) { rows[phone] = { phone, name, salt, hash, created_at }; save(); } };
+      if (sql.startsWith('INSERT')) {
+        return { run(phone, name, salt, hash, created_at) { rows[phone] = { phone, name, salt, hash, created_at }; save(); } };
+      }
+      if (sql.includes('WHERE phone IN')) {
+        // batch lookup by phone list
+        return { all(...phones) { return phones.flat().map(p => rows[p]).filter(Boolean); } };
+      }
+      if (sql.includes('LIKE')) {
+        // search by phone or name
+        return {
+          all(phoneQ, nameQ) {
+            const pq = (phoneQ || '').replace(/%/g, '').toLowerCase();
+            const nq = (nameQ || '').replace(/%/g, '').toLowerCase();
+            return allRows().filter(r =>
+              r.phone.replace(/\s/g, '').toLowerCase().includes(pq) ||
+              (r.name || '').toLowerCase().includes(nq)
+            );
+          },
+        };
+      }
+      // single-row SELECT (login, /me, register duplicate check)
       return { get(phone) { return rows[phone]; } };
     },
   };
