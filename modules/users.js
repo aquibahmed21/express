@@ -186,11 +186,13 @@ function setOnlinePhones(map) { _onlinePhones = map; }
 router.get('/api/users/search', (req, res) => {
   const h = req.headers.authorization || '';
   if (!h.startsWith('Bearer ') || !verifyToken(h.slice(7))) return res.status(401).json({ error: 'login required' });
-  const q = String(req.query.q ?? '').trim().toLowerCase();
+  const raw = String(req.query.q ?? '').trim();
+  // Strip spaces/dashes so "+91 98765 43210" matches the stored "+919876543210".
+  const q = raw.replace(/[\s\-().]/g, '').toLowerCase();
   if (!q) return res.json([]);
   const rows = db.prepare(
-    "SELECT phone, name FROM users WHERE lower(phone) LIKE ? OR lower(name) LIKE ? LIMIT 20",
-  ).all(`%${q}%`, `%${q}%`);
+    "SELECT phone, name FROM users WHERE lower(replace(phone,' ','')) LIKE ? OR lower(name) LIKE ? LIMIT 20",
+  ).all(`%${q}%`, `%${raw.toLowerCase()}%`);
   res.json(rows.map((r) => ({ phone: r.phone, name: r.name, online: !!(_onlinePhones?.has(r.phone)) })));
 });
 
