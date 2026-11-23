@@ -31,6 +31,13 @@ let db = null;
 // Stable across restarts only if JWT_SECRET is set as an env var.
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
+// Comma-separated phone numbers that are granted root/admin role automatically.
+// e.g. ADMIN_PHONES=+919876543210,+919876543211
+const ADMIN_PHONES = new Set(
+  (process.env.ADMIN_PHONES || '').split(',').map(p => p.replace(/\s/g, '')).filter(Boolean)
+);
+const ROOT_PHONE = (process.env.ROOT_PHONE || '').replace(/\s/g, '') || null;
+
 // ── Database ──────────────────────────────────────────────────────────────────
 
 const JSON_PATH = path.join(VOIP_DIR, 'users.json');
@@ -45,14 +52,31 @@ function openJsonDb() {
     exec() {},
     prepare(sql) {
       if (sql.startsWith('INSERT')) {
-        return { run(phone, name, salt, hash, created_at) { rows[phone] = { phone, name, salt, hash, created_at }; save(); } };
+        return { run(phone, name, salt, hash, created_at) { rows[phone] = { phone, name, salt, hash, created_at, role: 'user', blocked: 0 }; save(); } };
+      }
+      if (sql.includes('SELECT phone, name, role, blocked') && sql.includes('WHERE phone = ?')) {
+        return { get(phone) { return rows[phone] || null; } };
+      }
+      if (sql.includes('UPDATE users SET blocked')) {
+        return { run(blocked, phone) { if (rows[phone]) { rows[phone].blocked = blocked; save(); } } };
+      }
+      if (sql.includes('UPDATE users SET role')) {
+        return { run(role, phone) { if (rows[phone]) { rows[phone].role = role; save(); } } };
+      }
+      if (sql.includes('UPDATE users SET name') || sql.includes('UPDATE users SET salt')) {
+        // password reset: run(salt, hash, phone)
+        return { run(salt, hash, phone) { if (rows[phone]) { Object.assign(rows[phone], { salt, hash }); save(); } } };
+      }
+      if (sql.includes('DELETE FROM users WHERE phone')) {
+        return { run(phone) { delete rows[phone]; save(); } };
+      }
+      if (sql.includes('SELECT phone, name, role, blocked, created_at FROM users') && !sql.includes('WHERE')) {
+        return { all() { return allRows(); } };
       }
       if (sql.includes('WHERE phone IN')) {
-        // batch lookup by phone list
         return { all(...phones) { return phones.flat().map(p => rows[p]).filter(Boolean); } };
       }
       if (sql.includes('LIKE')) {
-        // search by phone or name
         return {
           all(phoneQ, nameQ) {
             const pq = (phoneQ || '').replace(/%/g, '').toLowerCase();
@@ -65,7 +89,7 @@ function openJsonDb() {
         };
       }
       // single-row SELECT (login, /me, register duplicate check)
-      return { get(phone) { return rows[phone]; } };
+      return { get(phone) { return rows[phone] || null; } };
     },
   };
 }
@@ -80,9 +104,20 @@ function openDb() {
       name        TEXT NOT NULL,
       salt        TEXT NOT NULL,
       hash        TEXT NOT NULL,
-      created_at  INTEGER NOT NULL
+      created_at  INTEGER NOT NULL,
+      role        TEXT NOT NULL DEFAULT 'user',
+      blocked     INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
+  `);
+  // Add columns to existing DBs that predate this schema (ALTER TABLE errors if column exists).
+  for (const ddl of [
+    "ALTER TABLE users ADD COLUMN role    TEXT NOT NULL DEFAULT 'user'",
+    "ALTER TABLE users ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0",
+  ]) {
+    try { db.exec(ddl); } catch (_) { /* column already exists */ }
+  }
+  db.exec(`
   `);
 }
 
@@ -106,10 +141,16 @@ function verifyPassword(password, salt, hash) {
 
 // ── Tokens (manual JWT-like) ──────────────────────────────────────────────────
 
-function makeToken(phone) {
+function roleFor(phone) {
+  if (phone === ROOT_PHONE) return 'root';
+  if (ADMIN_PHONES.has(phone)) return 'admin';
+  return null; // use DB value
+}
+
+function makeToken(phone, role) {
   const exp = Date.now() + 30 * 24 * 60 * 60 * 1000;
   const header = Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64url');
-  const body = Buffer.from(JSON.stringify({ phone, exp })).toString('base64url');
+  const body = Buffer.from(JSON.stringify({ phone, role: role || 'user', exp })).toString('base64url');
   const sig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
   return `${header}.${body}.${sig}`;
 }
@@ -167,7 +208,8 @@ router.post('/api/register', ah(async (req, res) => {
 
   const { salt, hash } = hashPassword(password);
   db.prepare('INSERT INTO users (phone, name, salt, hash, created_at) VALUES (?, ?, ?, ?, ?)').run(phone, name, salt, hash, Date.now());
-  res.status(201).json({ token: makeToken(phone), name, phone });
+  const role = roleFor(phone) || 'user';
+  res.status(201).json({ token: makeToken(phone, role), name, phone, role });
 }));
 
 router.post('/api/login', ah(async (req, res) => {
@@ -178,15 +220,17 @@ router.post('/api/login', ah(async (req, res) => {
   const wait = Math.max(byIp.wait(ip), byPhone.wait(phone));
   if (wait) { res.set('Retry-After', String(wait)); throw fail(429, `Too many attempts – try again in ${wait}s`); }
 
-  const u = db.prepare('SELECT name, salt, hash FROM users WHERE phone = ?').get(phone);
+  const u = db.prepare('SELECT phone, name, role, blocked, salt, hash FROM users WHERE phone = ?').get(phone);
   if (!u || !verifyPassword(password, u.salt, u.hash)) {
     byIp.fail(ip);
     byPhone.fail(phone);
     throw fail(401, 'Wrong phone number or password');
   }
+  if (u.blocked) throw fail(403, 'This account has been blocked');
   byIp.ok(ip);
   byPhone.ok(phone);
-  res.json({ token: makeToken(phone), name: u.name, phone });
+  const role = roleFor(phone) || u.role || 'user';
+  res.json({ token: makeToken(phone, role), name: u.name, phone, role });
 }));
 
 router.get('/api/me', (req, res) => {
@@ -194,9 +238,10 @@ router.get('/api/me', (req, res) => {
   if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'login required' });
   const payload = verifyToken(h.slice(7));
   if (!payload) return res.status(401).json({ error: 'invalid or expired token' });
-  const u = db.prepare('SELECT phone, name FROM users WHERE phone = ?').get(payload.phone);
+  const u = db.prepare('SELECT phone, name, role, blocked FROM users WHERE phone = ?').get(payload.phone);
   if (!u) return res.status(401).json({ error: 'user not found' });
-  res.json({ phone: u.phone, name: u.name });
+  const role = roleFor(u.phone) || u.role || 'user';
+  res.json({ phone: u.phone, name: u.name, role });
 });
 
 // Mounted after signaling starts so onlinePhones is populated.
@@ -229,6 +274,67 @@ router.post('/api/users/lookup', (req, res) => {
   res.json(phones
     .filter((p) => found.has(p))
     .map((p) => ({ phone: p, name: found.get(p), online: !!(_onlinePhones?.has(p)) })));
+});
+
+// ── Admin middleware ──────────────────────────────────────────────────────────
+
+function guardAdmin(req, res, next) {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ')) return res.status(401).json({ error: 'login required' });
+  const payload = verifyToken(h.slice(7));
+  if (!payload) return res.status(401).json({ error: 'invalid or expired token' });
+  const role = roleFor(payload.phone) || payload.role || 'user';
+  if (role !== 'admin' && role !== 'root') return res.status(403).json({ error: 'admin only' });
+  req.adminPhone = payload.phone;
+  req.adminRole = role;
+  next();
+}
+
+// ── Admin routes ──────────────────────────────────────────────────────────────
+
+/** GET /api/admin/users — list all users */
+router.get('/api/admin/users', guardAdmin, (req, res) => {
+  const rows = db.prepare('SELECT phone, name, role, blocked, created_at FROM users ORDER BY created_at DESC').all();
+  res.json(rows.map(r => ({
+    phone: r.phone, name: r.name,
+    role: roleFor(r.phone) || r.role || 'user',
+    blocked: !!r.blocked,
+    online: !!(_onlinePhones?.has(r.phone)),
+    createdAt: r.created_at,
+  })));
+});
+
+/** PATCH /api/admin/users/:phone — block/unblock, change role */
+router.patch('/api/admin/users/:phone', guardAdmin, ah(async (req, res) => {
+  const target = decodeURIComponent(req.params.phone);
+  const u = db.prepare('SELECT phone, name, role, blocked FROM users WHERE phone = ?').get(target);
+  if (!u) throw fail(404, 'User not found');
+  if (target === ROOT_PHONE && req.adminRole !== 'root') throw fail(403, 'Cannot modify root user');
+
+  const { blocked, role, password } = req.body || {};
+
+  if (blocked !== undefined) {
+    db.prepare('UPDATE users SET blocked = ? WHERE phone = ?').run(blocked ? 1 : 0, target);
+  }
+  if (role !== undefined) {
+    if (!['user', 'admin'].includes(role)) throw fail(400, 'role must be user or admin');
+    if (req.adminRole !== 'root') throw fail(403, 'Only root can change roles');
+    db.prepare('UPDATE users SET role = ? WHERE phone = ?').run(role, target);
+  }
+  if (password !== undefined) {
+    if (String(password).length < 6) throw fail(400, 'Password must be at least 6 characters');
+    const { salt, hash } = hashPassword(String(password));
+    db.prepare('UPDATE users SET salt = ?, hash = ? WHERE phone = ?').run(salt, hash, target);
+  }
+  res.json({ ok: true });
+}));
+
+/** DELETE /api/admin/users/:phone — delete a user */
+router.delete('/api/admin/users/:phone', guardAdmin, (req, res) => {
+  const target = decodeURIComponent(req.params.phone);
+  if (target === ROOT_PHONE) return res.status(403).json({ error: 'Cannot delete root user' });
+  db.prepare('DELETE FROM users WHERE phone = ?').run(target);
+  res.json({ ok: true });
 });
 
 module.exports = { usersRouter: router, loadUsers, verifyToken, setOnlinePhones };
