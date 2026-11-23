@@ -70,7 +70,7 @@ function openJsonDb() {
       if (sql.startsWith('INSERT')) {
         return { run(phone, name, salt, hash, created_at) { rows[phone] = { phone, name, salt, hash, created_at, role: 'user', blocked: 0 }; save(); } };
       }
-      if (sql.includes('SELECT phone, name, role, blocked') && sql.includes('WHERE phone = ?')) {
+      if (sql.includes('SELECT') && sql.includes('WHERE phone = ?')) {
         return { get(phone) { return rows[phone] || null; } };
       }
       if (sql.includes('UPDATE users SET blocked')) {
@@ -139,6 +139,38 @@ function openDb() {
 
 async function loadUsers() {
   openDb();
+  // Apply passwords set from the host app settings on every startup.
+  // ROOT_PASSWORD sets the root phone's password.
+  // ADMIN_PASSWORDS is a comma-separated list of phone:password pairs.
+  const rootPw = process.env.ROOT_PASSWORD;
+  if (rootPw && ROOT_PHONE) {
+    const existing = db.prepare('SELECT phone FROM users WHERE phone = ?').get(ROOT_PHONE);
+    if (existing) {
+      const { salt, hash } = hashPassword(rootPw);
+      db.prepare('UPDATE users SET salt = ?, hash = ? WHERE phone = ?').run(salt, hash, ROOT_PHONE);
+      console.log(`[users] Root password updated for ${ROOT_PHONE}`);
+    } else {
+      // Root account doesn't exist yet — auto-create it so root can log in without
+      // going through the registration flow first.
+      const { salt, hash } = hashPassword(rootPw);
+      db.prepare('INSERT INTO users (phone, name, salt, hash, created_at) VALUES (?, ?, ?, ?, ?)').run(ROOT_PHONE, 'Root', salt, hash, Date.now());
+      console.log(`[users] Root account auto-created for ${ROOT_PHONE}`);
+    }
+  }
+  const adminPwStr = process.env.ADMIN_PASSWORDS || '';
+  for (const pair of adminPwStr.split(',').map(s => s.trim()).filter(Boolean)) {
+    const colon = pair.indexOf(':');
+    if (colon < 1) continue;
+    const phone = pair.slice(0, colon).trim();
+    const pw = pair.slice(colon + 1);
+    if (!phone || !pw) continue;
+    const existing = db.prepare('SELECT phone FROM users WHERE phone = ?').get(phone);
+    if (existing) {
+      const { salt, hash } = hashPassword(pw);
+      db.prepare('UPDATE users SET salt = ?, hash = ? WHERE phone = ?').run(salt, hash, phone);
+      console.log(`[users] Admin password updated for ${phone}`);
+    }
+  }
 }
 
 // ── Password hashing (PBKDF2) ─────────────────────────────────────────────────
@@ -351,6 +383,21 @@ router.delete('/api/admin/users/:phone', guardAdmin, (req, res) => {
   if (target === ROOT_PHONE) return res.status(403).json({ error: 'Cannot delete root user' });
   db.prepare('DELETE FROM users WHERE phone = ?').run(target);
   res.json({ ok: true });
+});
+
+/** GET /api/ice-servers — returns TURN/STUN config for the MeshCall client.
+ *  The client fetches this at startup so TURN/STUN is managed from the host
+ *  app settings without needing a rebuild.
+ */
+router.get('/api/ice-servers', (req, res) => {
+  const iceServers = [];
+  const stun = process.env.STUN_SERVER;
+  if (stun) iceServers.push({ urls: stun });
+  const turn = process.env.TURN_SERVER;
+  const user = process.env.TURN_USERNAME;
+  const cred = process.env.TURN_CREDENTIAL;
+  if (turn && user && cred) iceServers.push({ urls: turn, username: user, credential: cred });
+  res.json({ iceServers });
 });
 
 module.exports = { usersRouter: router, loadUsers, verifyToken, setOnlinePhones };
