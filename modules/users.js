@@ -91,16 +91,19 @@ function openJsonDb() {
         return { all() { return allRows(); } };
       }
       if (sql.includes('WHERE phone IN')) {
-        return { all(...phones) { return phones.flat().map(p => rows[p]).filter(Boolean); } };
+        const excludeAdminRoot = sql.includes("role NOT IN");
+        return { all(...phones) { return phones.flat().map(p => rows[p]).filter(r => r && (!excludeAdminRoot || !['admin','root'].includes(r.role))); } };
       }
       if (sql.includes('LIKE')) {
+        const excludeAdminRoot = sql.includes("role NOT IN");
         return {
           all(phoneQ, nameQ) {
             const pq = (phoneQ || '').replace(/%/g, '').toLowerCase();
             const nq = (nameQ || '').replace(/%/g, '').toLowerCase();
             return allRows().filter(r =>
-              r.phone.replace(/\s/g, '').toLowerCase().includes(pq) ||
-              (r.name || '').toLowerCase().includes(nq)
+              (!excludeAdminRoot || !['admin','root'].includes(r.role)) &&
+              (r.phone.replace(/\s/g, '').toLowerCase().includes(pq) ||
+              (r.name || '').toLowerCase().includes(nq))
             );
           },
         };
@@ -315,7 +318,7 @@ router.get('/api/users/search', (req, res) => {
 router.post('/api/users/lookup', (req, res) => {
   const h = req.headers.authorization || '';
   if (!h.startsWith('Bearer ') || !verifyToken(h.slice(7))) return res.status(401).json({ error: 'login required' });
-  const phones = Array.isArray(req.body?.phones) ? req.body.phones.filter((p) => typeof p === 'string').slice(0, 500) : [];
+  const phones = Array.isArray(req.body?.phones) ? req.body.phones.filter((p) => typeof p === 'string').slice(0, 2000) : [];
   if (!phones.length) return res.json([]);
   const placeholders = phones.map(() => '?').join(',');
   const rows = db.prepare(`SELECT phone, name FROM users WHERE phone IN (${placeholders}) AND role NOT IN ('admin','root')`).all(...phones);
