@@ -306,7 +306,7 @@ router.get('/api/users/search', (req, res) => {
   const q = raw.replace(/[\s\-().]/g, '').toLowerCase();
   if (!q) return res.json([]);
   const rows = db.prepare(
-    "SELECT phone, name FROM users WHERE lower(replace(phone,' ','')) LIKE ? OR lower(name) LIKE ? LIMIT 20",
+    "SELECT phone, name FROM users WHERE (lower(replace(phone,' ','')) LIKE ? OR lower(name) LIKE ?) AND role NOT IN ('admin','root') LIMIT 20",
   ).all(`%${q}%`, `%${raw.toLowerCase()}%`);
   res.json(rows.map((r) => ({ phone: r.phone, name: r.name, online: !!(_onlinePhones?.has(r.phone)) })));
 });
@@ -318,7 +318,7 @@ router.post('/api/users/lookup', (req, res) => {
   const phones = Array.isArray(req.body?.phones) ? req.body.phones.filter((p) => typeof p === 'string').slice(0, 500) : [];
   if (!phones.length) return res.json([]);
   const placeholders = phones.map(() => '?').join(',');
-  const rows = db.prepare(`SELECT phone, name FROM users WHERE phone IN (${placeholders})`).all(...phones);
+  const rows = db.prepare(`SELECT phone, name FROM users WHERE phone IN (${placeholders}) AND role NOT IN ('admin','root')`).all(...phones);
   const found = new Map(rows.map((r) => [r.phone, r.name]));
   res.json(phones
     .filter((p) => found.has(p))
