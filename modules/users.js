@@ -426,30 +426,40 @@ const FREE_STUN = [
 ];
 
 router.get('/api/ice-servers', async (req, res) => {
-  const cfKeyId  = process.env.CF_TURN_KEY_ID;
-  const cfToken  = process.env.CF_TURN_API_TOKEN;
-  const manualStun = process.env.STUN_SERVER;
-  const manualTurn = process.env.TURN_SERVER;
-  const manualUser = process.env.TURN_USERNAME;
-  const manualCred = process.env.TURN_CREDENTIAL;
+  const cfKeyId = process.env.CF_TURN_KEY_ID;
+  const cfToken = process.env.CF_TURN_API_TOKEN;
 
-  // 1. Cloudflare TURN (preferred)
+  // 1. Cloudflare TURN (preferred — takes the whole response slot)
   if (cfKeyId && cfToken) {
     try {
       const iceServers = await fetchCloudflareTurn(cfKeyId, cfToken);
       return res.json({ iceServers });
     } catch (e) {
       console.error('[ice] Cloudflare TURN fetch failed:', e.message);
-      // fall through to manual / free STUN
+      // fall through
     }
   }
 
-  // 2. Manually configured TURN/STUN
-  if (manualTurn && manualUser && manualCred) {
+  // 2. JSON arrays (multi-server, ordered, set from VPS Manager)
+  const stunJson = process.env.STUN_SERVERS_JSON;
+  const turnJson = process.env.TURN_SERVERS_JSON;
+  if (stunJson || turnJson) {
     const iceServers = [];
-    if (manualStun) iceServers.push({ urls: manualStun });
-    iceServers.push({ urls: manualTurn, username: manualUser, credential: manualCred });
-    return res.json({ iceServers });
+    try {
+      if (stunJson) {
+        const urls = JSON.parse(stunJson).filter(u => typeof u === 'string' && u);
+        if (urls.length) iceServers.push({ urls });
+      }
+    } catch (e) { console.error('[ice] STUN_SERVERS_JSON parse error:', e.message); }
+    try {
+      if (turnJson) {
+        const entries = JSON.parse(turnJson);
+        for (const e of entries) {
+          if (e && e.urls) iceServers.push({ urls: e.urls, username: e.username, credential: e.credential });
+        }
+      }
+    } catch (e) { console.error('[ice] TURN_SERVERS_JSON parse error:', e.message); }
+    if (iceServers.length) return res.json({ iceServers });
   }
 
   // 3. No TURN configured — return free public STUN as best-effort fallback.
