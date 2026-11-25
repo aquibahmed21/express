@@ -397,18 +397,63 @@ router.delete('/api/admin/users/:phone', guardAdmin, (req, res) => {
 });
 
 /** GET /api/ice-servers — returns TURN/STUN config for the MeshCall client.
- *  The client fetches this at startup so TURN/STUN is managed from the host
- *  app settings without needing a rebuild.
+ *  Priority: Cloudflare TURN (auto-credentials) → manual TURN → free public STUN only.
+ *  Cloudflare credentials are cached for 23 h so we don't hammer the API.
  */
-router.get('/api/ice-servers', (req, res) => {
-  const iceServers = [];
-  const stun = process.env.STUN_SERVER;
-  if (stun) iceServers.push({ urls: stun });
-  const turn = process.env.TURN_SERVER;
-  const user = process.env.TURN_USERNAME;
-  const cred = process.env.TURN_CREDENTIAL;
-  if (turn && user && cred) iceServers.push({ urls: turn, username: user, credential: cred });
-  res.json({ iceServers });
+let _cfCache = null; // { expires: ms, iceServers: RTCIceServer[] }
+
+async function fetchCloudflareTurn(keyId, apiToken) {
+  if (_cfCache && _cfCache.expires > Date.now()) return _cfCache.iceServers;
+  const url = `https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ttl: 86400 }),
+  });
+  if (!res.ok) throw new Error(`Cloudflare TURN API ${res.status}`);
+  const json = await res.json();
+  // Cloudflare returns { iceServers: { urls, username, credential } } (singular object, not array)
+  const srv = json.iceServers;
+  const servers = [{ urls: srv.urls, username: srv.username, credential: srv.credential }];
+  _cfCache = { expires: Date.now() + 23 * 60 * 60 * 1000, iceServers: servers };
+  return servers;
+}
+
+// Well-known free public STUN servers returned when no TURN is configured.
+const FREE_STUN = [
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+];
+
+router.get('/api/ice-servers', async (req, res) => {
+  const cfKeyId  = process.env.CF_TURN_KEY_ID;
+  const cfToken  = process.env.CF_TURN_API_TOKEN;
+  const manualStun = process.env.STUN_SERVER;
+  const manualTurn = process.env.TURN_SERVER;
+  const manualUser = process.env.TURN_USERNAME;
+  const manualCred = process.env.TURN_CREDENTIAL;
+
+  // 1. Cloudflare TURN (preferred)
+  if (cfKeyId && cfToken) {
+    try {
+      const iceServers = await fetchCloudflareTurn(cfKeyId, cfToken);
+      return res.json({ iceServers });
+    } catch (e) {
+      console.error('[ice] Cloudflare TURN fetch failed:', e.message);
+      // fall through to manual / free STUN
+    }
+  }
+
+  // 2. Manually configured TURN/STUN
+  if (manualTurn && manualUser && manualCred) {
+    const iceServers = [];
+    if (manualStun) iceServers.push({ urls: manualStun });
+    iceServers.push({ urls: manualTurn, username: manualUser, credential: manualCred });
+    return res.json({ iceServers });
+  }
+
+  // 3. No TURN configured — return free public STUN as best-effort fallback.
+  res.json({ iceServers: FREE_STUN });
 });
 
 module.exports = { usersRouter: router, loadUsers, verifyToken, setOnlinePhones };
