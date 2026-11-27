@@ -85,3 +85,24 @@ ROOT_PIN=... FAMILIES="sc_majid:822474" node scripts/seed-auth.js family/auth.js
 ```
 
 or start once with `ROOT_PIN=...` to create it with only the root account, then create families as root.
+
+## Expense Studio backups (`modules/expense.js`)
+
+Separate mobile-number accounts (not the MeshCall ones). Each user uploads their Expense Studio `.db`; the server keeps the last 7 days.
+
+```
+expense/users.json                          accounts (PBKDF2 hashes)
+expense/<mobile>/expense-YYYY-MM-DD.db      one file per day (a newer upload the same day replaces it)
+```
+
+`expense/` sits beside `family/` and `voip/` (parent of `FAMILY_DIR`). Files older than 7 days are deleted after each upload and every 6 hours.
+
+| Route | Auth | Body / returns |
+|---|---|---|
+| `POST /expense/register` | – | `{ phone, password }` → `{ token, phone }` (phone 7–15 digits, password ≥ 6) |
+| `POST /expense/login` | – | `{ phone, password }` → `{ token, phone }` |
+| `POST /expense/upload` | Bearer | raw `.db` bytes (SQLite header checked, max 100 MB) → `{ name, size, kept }` |
+| `GET /expense/backups` | Bearer | `{ keepDays, files: [{ name, size, modified }] }` |
+| `GET /expense/backups/:name` | Bearer | the `.db` file |
+
+Tokens last 30 days and only work for `/expense`. Optional env: `EXPENSE_JWT_SECRET`.

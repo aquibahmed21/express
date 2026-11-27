@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { familyRouter, initFamilyStorage } = require('./modules/family');
 const { authRouter } = require('./modules/auth');
+const { expenseRouter } = require('./modules/expense');
 const { usersRouter, loadUsers, verifyToken, setOnlinePhones } = require('./modules/users');
 const { setupSignaling, onlinePhones } = require('./modules/signaling');
 
@@ -15,6 +16,9 @@ app.use(cors());
 
 // Mounted before the global JSON parser: it brings its own, larger body limits.
 app.use(familyRouter);
+
+// Expense Studio backups: brings its own body parsers (small JSON, large raw .db).
+app.use(expenseRouter);
 
 app.use(express.json());
 app.use(authRouter);
